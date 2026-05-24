@@ -34,7 +34,7 @@ jobs:
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$BLINK_VERSION" 2>&1 | tee setup.log
 
-      - name: Fix pbxproj and Pin deps
+      - name: Fix pbxproj
         run: |
           cd builder/blink-src
           plutil -lint Blink.xcodeproj/project.pbxproj || {
@@ -43,17 +43,67 @@ jobs:
             sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
             plutil -lint Blink.xcodeproj/project.pbxproj
           }
-          echo "Pinning swiftui-cached-async-image to 2.1.1"
-          RESOLVED=$(find . -name "Package.resolved" | head -1)
-          if [ -n "$RESOLVED" ] && grep -q "cached-async-image" "$RESOLVED"; then
-            sed -i '' 's/"version" *: *"2\.1\.2"/"version" : "2.1.1"/g' "$RESOLVED"
-            grep "cached-async" "$RESOLVED" -A5
-          fi
+
+      - name: Resolve and patch dependencies
+        run: |
+          cd builder/blink-src
+
+          # Clear stale SPM caches
+          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
+
+          # Step 1: Resolve packages (will fail on visionOS but downloads everything)
+          echo "=== Resolving packages (expect failure) ==="
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -resolvePackageDependencies \
+            -skipPackagePluginValidation \
+            -skipMacroValidation 2>&1 || echo "Expected failure - packages downloaded"
+
+          # Step 2: Find and patch the swiftui-cached-async-image Package.swift
+          echo ""
+          echo "=== Patching dependency manifests ==="
+
+          # Find in DerivedData checkouts
+          find ../build-output -name "Package.swift" -path "*checkouts*" 2>/dev/null | while read f; do
+            if grep -q "visionOS" "$f" 2>/dev/null; then
+              echo "Patching: $f"
+              # Upgrade swift-tools-version to 5.9 AND keep visionOS
+              sed -i '' '1s/swift-tools-version:[0-9.]*/swift-tools-version:5.9/' "$f"
+              echo "  -> upgraded to swift-tools-version:5.9"
+              head -1 "$f"
+            fi
+          done
+
+          # Also find in Xcode SourcePackages
+          find . -name "Package.swift" -path "*SourcePackages*checkouts*" 2>/dev/null | while read f; do
+            if grep -q "visionOS" "$f" 2>/dev/null; then
+              echo "Patching SourcePackages: $f"
+              sed -i '' '1s/swift-tools-version:[0-9.]*/swift-tools-version:5.9/' "$f"
+              head -1 "$f"
+            fi
+          done
+
+          # Step 3: Clear the manifest compilation cache so SPM recompiles
+          echo ""
+          echo "=== Clearing manifest cache ==="
+          rm -rf ~/Library/Caches/org.swift.swiftpm/manifests 2>/dev/null || true
+          find ~/Library/Caches -name "*cached-async-image*" -delete 2>/dev/null || true
+          find /var/folders -name "*cached-async-image*manifest*" -delete 2>/dev/null || true
+
+          # Step 4: Re-resolve (should work now with 5.9 tools version)
+          echo ""
+          echo "=== Re-resolving packages ==="
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -resolvePackageDependencies \
+            -skipPackagePluginValidation \
+            -skipMacroValidation 2>&1 | tail -20
+
+          echo "Package resolution done"
 
       - name: Build
         run: |
           cd builder/blink-src
-          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
             -configuration Release \
@@ -73,7 +123,7 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           echo "Build exit code: $BUILD_EXIT"
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            tail -50 ../build.log
+            tail -80 ../build.log
             exit 1
           fi
           find ../build-output -name "*.app" -type d
