@@ -20,64 +20,94 @@ jobs:
           sw_vers
           echo "=== Xcode ==="
           xcodebuild -version
-          echo "=== Disk Space ==="
+          echo "=== Disk ==="
           df -h /
 
       - name: "📦 Install Dependencies"
         run: |
           brew install jq || true
-          python3 --version
-          git --version
 
       - name: "📥 Clone GPL Builder"
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
-          cd builder
-          ls -la
-          echo ""
-          echo "=== Builder script ==="
-          head -50 build-blink-shell-gpl.sh
+          ls -la builder/
 
-      - name: "🔨 Run GPL Build Script"
+      - name: "🔨 Build Blink Shell"
         run: |
           cd builder
           chmod +x build-blink-shell-gpl.sh
 
           VERSION="${{ github.event.inputs.version }}"
-          echo "Building Blink Shell $VERSION..."
+          echo "============================================"
+          echo "  Building Blink Shell $VERSION"
+          echo "============================================"
 
-          # Run the community build script
-          ./build-blink-shell-gpl.sh --build --keep-build --keep-source --version "$VERSION" 2>&1 | tee build.log
+          # Clean any caches first
+          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
+          rm -rf ~/Library/Developer/Xcode/DerivedData/* 2>/dev/null || true
+
+          # Run with overwrite and clean to ensure fresh build
+          ./build-blink-shell-gpl.sh \
+            --overwrite \
+            --clean \
+            --keep-build \
+            --keep-source \
+            --version "$VERSION" 2>&1 | tee build-full.log
 
           echo ""
-          echo "=== Build Complete ==="
-          ls -lh dist/ 2>/dev/null || echo "No dist directory found"
+          echo "=== Exit code: $? ==="
+          echo "=== Checking for IPA ==="
+          find . -name "*.ipa" -type f -exec ls -lh {} \; || echo "No IPA found"
+          ls -lh dist/ 2>/dev/null || echo "No dist/ directory"
 
-      - name: "📦 Verify IPA"
-        if: success()
+      - name: "📦 Prepare IPA for upload"
+        if: always()
         run: |
           cd builder
-          echo "=== IPA Files ==="
-          find . -name "*.ipa" -type f -exec ls -lh {} \;
-          
-          # Copy to workspace root for upload
-          cp dist/*.ipa ../ 2>/dev/null || find . -name "*.ipa" -exec cp {} ../ \;
-          ls -lh ../*.ipa
 
-      - name: "📤 Upload IPA Artifact"
+          # Find any IPA file
+          IPA=$(find . -name "*.ipa" -type f | head -1)
+          
+          if [ -n "$IPA" ]; then
+            echo "✅ Found IPA: $IPA"
+            cp "$IPA" ../Blink-Shell.ipa
+            ls -lh ../Blink-Shell.ipa
+          else
+            echo "❌ No IPA found"
+            echo "=== Checking blink-src for .app ==="
+            find blink-src -name "*.app" -type d 2>/dev/null | head -5 || echo "No .app found"
+            find build-output -name "*.app" -type d 2>/dev/null | head -5 || echo "No .app in build-output"
+            
+            # Try to package manually if .app exists
+            APP=$(find . -name "Blink.app" -type d | head -1)
+            if [ -n "$APP" ]; then
+              echo "Found .app at $APP — packaging manually"
+              mkdir -p Payload
+              cp -r "$APP" Payload/
+              zip -r ../Blink-Shell.ipa Payload/
+              ls -lh ../Blink-Shell.ipa
+            else
+              echo "=== Build log tail ==="
+              tail -100 build-full.log 2>/dev/null || true
+              tail -100 build-output/build.log 2>/dev/null || true
+              exit 1
+            fi
+          fi
+
+      - name: "📤 Upload IPA"
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Blink-Shell-IPA-${{ github.event.inputs.version }}
-          path: "*.ipa"
+          name: Blink-Shell-IPA
+          path: "Blink-Shell.ipa"
           retention-days: 30
 
-      - name: "📤 Upload Build Logs (on failure)"
-        if: failure()
+      - name: "📤 Upload All Logs"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
-            builder/build.log
-            builder/build-output/**/*.log
+            builder/build-full.log
+            builder/build-output/build.log
           retention-days: 7
