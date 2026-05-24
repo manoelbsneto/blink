@@ -18,70 +18,64 @@ jobs:
     env:
       BLINK_VERSION: v18.4.2
     steps:
-      - name: Setup Xcode
+      - name: Select Xcode 26
         run: |
+          echo "=== Available Xcode versions ==="
+          ls /Applications/ | grep Xcode
+          XCODE_26=$(ls -d /Applications/Xcode_26* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE_26" ]; then
+            echo "ERROR: Xcode 26 not found on this runner"
+            echo "Falling back to default Xcode"
+            xcodebuild -version
+            exit 1
+          fi
+          echo "Selecting: $XCODE_26"
+          sudo xcode-select -s "$XCODE_26"
           xcodebuild -version
           swift --version
+
       - name: Install tools
         run: brew install jq || true
+
       - name: Clone and setup source
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
           cd builder
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$BLINK_VERSION" 2>&1 | tee setup.log
-      - name: Patch source for Xcode 16.4 compat
+
+      - name: Fix project configuration
         run: |
           cd builder/blink-src
-          echo "=== Step 1: Fix pbxproj ==="
+
+          echo "=== Fix pbxproj (reset + strip team) ==="
           git checkout -- Blink.xcodeproj/project.pbxproj
           sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
           plutil -lint Blink.xcodeproj/project.pbxproj
 
-          echo "=== Step 2: Redirect cached-async-image to fixed fork ==="
-          grep -rl "lorenzofiamingo/swiftui-cached-async-image" . \
-            --include="*.pbxproj" --include="*.swift" --include="*.resolved" 2>/dev/null \
-            | while read f; do
-                echo "  Patching: $f"
-                sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
-              done
+          echo "=== Remove duplicate compile source ==="
+          # MoshCustomOptionsPickerView.swift is listed twice in Compile Sources
+          # Remove the duplicate by keeping only the first occurrence
+          awk '!seen[$0]++ || !/MoshCustomOptionsPickerView\.swift.*in Sources/' \
+            Blink.xcodeproj/project.pbxproj > /tmp/pbxproj.tmp && \
+            mv /tmp/pbxproj.tmp Blink.xcodeproj/project.pbxproj
 
-          echo "=== Step 3: Stub iOS 26 UIGlassEffect APIs (not in Xcode 16.4 SDK) ==="
-          KBFILE="Blink/SmarterKeys/KBAccessoryView.swift"
-          if [ -f "$KBFILE" ] && grep -q "UIGlassEffect" "$KBFILE"; then
-            echo "  Removing iOS 26 glass effect code from $KBFILE"
-            # Remove the _createGlassEffect function entirely
-            sed -i '' '/@available(iOS 26.0, \*)/,/^  }$/{
-              /func _createGlassEffect/,/^  }/{
-                s/.*/\/\/ STUBBED: iOS 26 API removed for Xcode 16.4 compat/
-              }
-            }' "$KBFILE"
-            # Remove UIGlassEffect references from _setupGlassMaterialEffect
-            sed -i '' 's/let glassEffect = _createGlassEffect()/\/\/ let glassEffect = _createGlassEffect() \/\/ STUBBED/g' "$KBFILE"
-            sed -i '' 's/glassEffectView.cornerConfiguration = .capsule(maximumRadius: 16)/\/\/ glassEffectView.cornerConfiguration = .capsule(maximumRadius: 16) \/\/ STUBBED/g' "$KBFILE"
-            sed -i '' 's/glassEffectView.effect = glassEffect/\/\/ glassEffectView.effect = glassEffect \/\/ STUBBED/g' "$KBFILE"
-            # Verify no UIGlassEffect remains
-            if grep -q "UIGlassEffect" "$KBFILE"; then
-              echo "  WARNING: UIGlassEffect still present, using brute force removal"
-              sed -i '' 's/UIGlassEffect/AnyObject/g' "$KBFILE"
-            fi
-            echo "  Done patching $KBFILE"
-          fi
+          echo "=== Verify project file ==="
+          plutil -lint Blink.xcodeproj/project.pbxproj
+          echo "Project fixes applied"
 
-          echo "=== Step 4: Verify all patches ==="
-          grep -r "cached-async-image" . --include="*.pbxproj" | head -2
-          echo "Patching complete"
       - name: Resolve packages
         run: |
           cd builder/blink-src
           xcodebuild -resolvePackageDependencies \
             -project Blink.xcodeproj \
             -scheme Blink 2>&1 | grep -E "(Resolved|Fetching|Checking out|error:|warning:)" || true
+          echo "Package resolution complete"
+
       - name: Build
         run: |
           BUILD_DIR="$GITHUB_WORKSPACE/builder/build-output"
           cd builder/blink-src
-          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
             -configuration Release \
@@ -97,26 +91,30 @@ jobs:
             ENABLE_PREVIEWS=NO \
             build 2>&1 | tee ../build.log
           BUILD_EXIT=${PIPESTATUS[0]}
-          echo "Build exit: $BUILD_EXIT"
+          echo "Build exit code: $BUILD_EXIT"
           if [ "$BUILD_EXIT" -ne 0 ]; then
             echo "=== UNIQUE ERRORS ==="
             grep " error: " ../build.log | sort -u | head -20
-            echo "=== LAST 30 LINES ==="
+            echo "=== BUILD SUMMARY ==="
             tail -30 ../build.log
             exit 1
           fi
+          echo "=== BUILD SUCCEEDED ==="
           find "$BUILD_DIR/Products" -name "*.app" -type d
+
       - name: Package IPA
         if: success()
         run: |
           cd builder
           APP=$(find build-output -name "Blink.app" -type d | head -1)
-          if [ -z "$APP" ]; then echo "No .app found"; exit 1; fi
-          echo "Found app: $APP"
+          if [ -z "$APP" ]; then echo "ERROR: No .app bundle found"; exit 1; fi
+          echo "Packaging: $APP"
           mkdir -p Payload dist
           cp -r "$APP" Payload/
           cd Payload && zip -r ../dist/Blink-unsigned.ipa Blink.app && cd ..
+          echo "=== IPA Created ==="
           ls -lh dist/
+
       - name: Upload IPA
         if: success()
         uses: actions/upload-artifact@v4
@@ -124,6 +122,7 @@ jobs:
           name: Blink-Shell-IPA
           path: builder/dist/*.ipa
           retention-days: 30
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
