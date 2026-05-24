@@ -30,101 +30,53 @@ jobs:
           cd builder
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$BLINK_VERSION" 2>&1 | tee setup.log
-      - name: Fix project and redirect deps
+      - name: Patch source for Xcode 16.4 compat
         run: |
           cd builder/blink-src
-          echo "=== Fix pbxproj ==="
+          echo "=== Step 1: Fix pbxproj ==="
           git checkout -- Blink.xcodeproj/project.pbxproj
           sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
           plutil -lint Blink.xcodeproj/project.pbxproj
 
-          echo "=== Redirect cached-async-image to fixed fork ==="
+          echo "=== Step 2: Redirect cached-async-image to fixed fork ==="
           grep -rl "lorenzofiamingo/swiftui-cached-async-image" . \
             --include="*.pbxproj" --include="*.swift" --include="*.resolved" 2>/dev/null \
             | while read f; do
-                echo "Patching: $f"
+                echo "  Patching: $f"
                 sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
               done
 
-          echo "=== Patch iOS 26 APIs for Xcode 16.4 compatibility ==="
+          echo "=== Step 3: Stub iOS 26 UIGlassEffect APIs (not in Xcode 16.4 SDK) ==="
           KBFILE="Blink/SmarterKeys/KBAccessoryView.swift"
           if [ -f "$KBFILE" ] && grep -q "UIGlassEffect" "$KBFILE"; then
-            echo "Stubbing iOS 26 UIGlassEffect APIs..."
-            python3 - "$KBFILE" << 'PYEOF'
-import sys, re
-
-path = sys.argv[1]
-with open(path, 'r') as f:
-    content = f.read()
-
-# Wrap @available(iOS 26.0, *) functions with #if compiler guard
-# This makes them invisible to Xcode 16.4 which uses Swift 5.x compiler
-lines = content.split('\n')
-new_lines = []
-i = 0
-in_block = False
-brace_depth = 0
-skip_until_close = False
-
-while i < len(lines):
-    line = lines[i]
-
-    # Detect @available(iOS 26 pattern followed by func
-    if '@available(iOS 26' in line and not in_block:
-        # Check next line for func
-        if i + 1 < len(lines) and ('func _createGlassEffect' in lines[i+1] or
-                                     'func _setupGlassMaterial' in lines[i+1]):
-            new_lines.append('  #if compiler(>=6.2)')
-            new_lines.append(line)
-            skip_until_close = True
-            brace_depth = 0
-            i += 1
-            continue
-
-    if skip_until_close:
-        new_lines.append(line)
-        brace_depth += line.count('{') - line.count('}')
-        if brace_depth <= 0 and '{' not in line and '}' in line:
-            # Check if we closed the function
-            stripped = line.strip()
-            if stripped == '}':
-                new_lines.append('  #endif')
-                skip_until_close = False
-        elif brace_depth < 0:
-            new_lines.append('  #endif')
-            skip_until_close = False
-        i += 1
-        continue
-
-    # Handle UIGlassEffect type in property declarations
-    if 'UIGlassEffect' in line and '@available' not in line and 'func' not in line:
-        new_lines.append('  #if compiler(>=6.2)')
-        new_lines.append(line)
-        new_lines.append('  #endif')
-        i += 1
-        continue
-
-    # Handle cornerConfiguration
-    if 'cornerConfiguration' in line and '@available' not in line:
-        new_lines.append('  #if compiler(>=6.2)')
-        new_lines.append(line)
-        new_lines.append('  #endif')
-        i += 1
-        continue
-
-    new_lines.append(line)
-    i += 1
-
-with open(path, 'w') as f:
-    f.write('\n'.join(new_lines))
-
-print(f"Patched {path}")
-PYEOF
+            echo "  Removing iOS 26 glass effect code from $KBFILE"
+            # Remove the _createGlassEffect function entirely
+            sed -i '' '/@available(iOS 26.0, \*)/,/^  }$/{
+              /func _createGlassEffect/,/^  }/{
+                s/.*/\/\/ STUBBED: iOS 26 API removed for Xcode 16.4 compat/
+              }
+            }' "$KBFILE"
+            # Remove UIGlassEffect references from _setupGlassMaterialEffect
+            sed -i '' 's/let glassEffect = _createGlassEffect()/\/\/ let glassEffect = _createGlassEffect() \/\/ STUBBED/g' "$KBFILE"
+            sed -i '' 's/glassEffectView.cornerConfiguration = .capsule(maximumRadius: 16)/\/\/ glassEffectView.cornerConfiguration = .capsule(maximumRadius: 16) \/\/ STUBBED/g' "$KBFILE"
+            sed -i '' 's/glassEffectView.effect = glassEffect/\/\/ glassEffectView.effect = glassEffect \/\/ STUBBED/g' "$KBFILE"
+            # Verify no UIGlassEffect remains
+            if grep -q "UIGlassEffect" "$KBFILE"; then
+              echo "  WARNING: UIGlassEffect still present, using brute force removal"
+              sed -i '' 's/UIGlassEffect/AnyObject/g' "$KBFILE"
+            fi
+            echo "  Done patching $KBFILE"
           fi
 
-          echo "=== Verify redirect ==="
-          grep -r "cached-async-image" . --include="*.pbxproj" --include="*.resolved" | head -3
-          echo "Done"
+          echo "=== Step 4: Verify all patches ==="
+          grep -r "cached-async-image" . --include="*.pbxproj" | head -2
+          echo "Patching complete"
+      - name: Resolve packages
+        run: |
+          cd builder/blink-src
+          xcodebuild -resolvePackageDependencies \
+            -project Blink.xcodeproj \
+            -scheme Blink 2>&1 | grep -E "(Resolved|Fetching|Checking out|error:|warning:)" || true
       - name: Build
         run: |
           BUILD_DIR="$GITHUB_WORKSPACE/builder/build-output"
@@ -147,10 +99,10 @@ PYEOF
           BUILD_EXIT=${PIPESTATUS[0]}
           echo "Build exit: $BUILD_EXIT"
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "=== ERRORS ==="
+            echo "=== UNIQUE ERRORS ==="
             grep " error: " ../build.log | sort -u | head -20
-            echo "=== LAST 40 LINES ==="
-            tail -40 ../build.log
+            echo "=== LAST 30 LINES ==="
+            tail -30 ../build.log
             exit 1
           fi
           find "$BUILD_DIR/Products" -name "*.app" -type d
@@ -159,8 +111,8 @@ PYEOF
         run: |
           cd builder
           APP=$(find build-output -name "Blink.app" -type d | head -1)
-          if [ -z "$APP" ]; then echo "No app found"; exit 1; fi
-          echo "Found: $APP"
+          if [ -z "$APP" ]; then echo "No .app found"; exit 1; fi
+          echo "Found app: $APP"
           mkdir -p Payload dist
           cp -r "$APP" Payload/
           cd Payload && zip -r ../dist/Blink-unsigned.ipa Blink.app && cd ..
