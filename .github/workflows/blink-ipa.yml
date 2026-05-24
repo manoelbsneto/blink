@@ -63,32 +63,183 @@ jobs:
                 sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
               done
 
-          echo "=== Step 5: Create sideload-friendly entitlements ==="
+          echo "=== Step 5: Remove paywall (GPL sideload build) ==="
+          ENTITLEMENTS_MGR="Blink/Subscriptions/EntitlementsManager.swift"
+          if [ -f "$ENTITLEMENTS_MGR" ]; then
+            python3 - "$ENTITLEMENTS_MGR" << 'PAYWALL_PY'
+          import re, sys
+          path = sys.argv[1]
+          with open(path, "r") as fh:
+              data = fh.read()
+
+          def replace_func(name, body_lines):
+              pattern = re.compile(rf"\bpublic func {re.escape(name)}\b")
+              m = pattern.search(data)
+              if not m:
+                  return data, False
+              line_start = data.rfind("\n", 0, m.start()) + 1
+              line_end = data.find("\n", m.start())
+              if line_end == -1:
+                  line_end = len(data)
+              indent = re.match(r"[ \t]*", data[line_start:line_end]).group(0)
+              brace_open = data.find("{", m.end())
+              if brace_open == -1:
+                  return data, False
+              depth = 0
+              i = brace_open
+              in_string = in_line_comment = in_block_comment = False
+              while i < len(data):
+                  ch = data[i]
+                  nxt = data[i + 1] if i + 1 < len(data) else ""
+                  if in_line_comment:
+                      if ch == "\n": in_line_comment = False
+                      i += 1; continue
+                  if in_block_comment:
+                      if ch == "*" and nxt == "/": in_block_comment = False; i += 2; continue
+                      i += 1; continue
+                  if in_string:
+                      if ch == "\\": i += 2; continue
+                      if ch == "\"": in_string = False
+                      i += 1; continue
+                  if ch == "/" and nxt == "/": in_line_comment = True; i += 2; continue
+                  if ch == "/" and nxt == "*": in_block_comment = True; i += 2; continue
+                  if ch == "\"": in_string = True; i += 1; continue
+                  if ch == "{": depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          brace_close = i; break
+                  i += 1
+              else:
+                  return data, False
+              inner_indent = indent + "  "
+              new_body = "\n".join([inner_indent + line for line in body_lines])
+              return data[:brace_open + 1] + "\n" + new_body + "\n" + indent + "}" + data[brace_close + 1:], True
+
+          changed = False
+          data, c = replace_func("currentPlanName", ["// GPL_PATCH", 'return "GPL Sideload Build"']); changed = changed or c
+          data, c = replace_func("customerTier", ["// GPL_PATCH", "return CustomerTier.Classic"]); changed = changed or c
+          data, c = replace_func("hasActiveSubscriptions", ["// GPL_PATCH", "return true"]); changed = changed or c
+          if changed:
+              with open(path, "w") as fh: fh.write(data)
+              print("  Paywall removed")
+          PAYWALL_PY
+          else
+            echo "  Warning: EntitlementsManager.swift not found"
+          fi
+
+          echo "=== Step 6: Skip Migrator (uses FileProvider APIs) ==="
+          APP_DELEGATE="Blink/AppDelegate.m"
+          if [ -f "$APP_DELEGATE" ]; then
+            if grep -q '^\s*\[Migrator perform\];' "$APP_DELEGATE" 2>/dev/null; then
+              sed -i '' 's/^\([[:space:]]*\)\[Migrator perform\];/\1\/\/ [Migrator perform]; \/\/ Disabled for sideload/' "$APP_DELEGATE"
+              echo "  Migrator disabled"
+            else
+              echo "  Migrator already disabled or not found"
+            fi
+          fi
+
+          echo "=== Step 7: Guard FileProvider APIs ==="
+          FP_DOMAIN="Settings/Model/FileProviderDomain.swift"
+          if [ -f "$FP_DOMAIN" ]; then
+            python3 - "$FP_DOMAIN" << 'FP_PY'
+          import re, sys
+          path = sys.argv[1]
+          with open(path, "r") as fh: data = fh.read()
+          changed = False
+          if "FileProviderAvailability.isAvailable" not in data:
+              pattern = re.compile(r'(^[ \t]*)@objc static func syncWithBKHosts\(\) \{', re.M)
+              match = pattern.search(data)
+              if match:
+                  indent = match.group(1)
+                  inner = indent + "  "
+                  guard = f"\n{inner}guard FileProviderAvailability.isAvailable else {{\n{inner}  return\n{inner}}}\n"
+                  data = data[:match.end()] + guard + data[match.end():]
+                  changed = True
+          if "final class FileProviderAvailability" not in data:
+              avail = '\n\n@objc final class FileProviderAvailability: NSObject {\n  @objc static let isAvailable: Bool = {\n    guard let pluginsURL = Bundle.main.builtInPlugInsURL else { return false }\n    guard let pluginURLs = try? FileManager.default.contentsOfDirectory(at: pluginsURL, includingPropertiesForKeys: nil) else { return false }\n    for url in pluginURLs where url.pathExtension == "appex" {\n      guard let bundle = Bundle(url: url),\n            let extensionInfo = bundle.infoDictionary?["NSExtension"] as? [String: Any],\n            let pointIdentifier = extensionInfo["NSExtensionPointIdentifier"] as? String\n      else { continue }\n      if pointIdentifier == "com.apple.fileprovider-nonui" ||\n         pointIdentifier == "com.apple.fileprovider" ||\n         pointIdentifier == "com.apple.fileprovider-replicated" {\n        return true\n      }\n    }\n    return false\n  }()\n}\n'
+              data = data.rstrip() + avail
+              changed = True
+          if changed:
+              with open(path, "w") as fh: fh.write(data)
+              print("  FileProvider guards applied")
+          FP_PY
+          fi
+
+          echo "=== Step 8: Guard FileProvider in Migrator ==="
+          MIGRATION="Blink/Migrator/1810Migration.swift"
+          if [ -f "$MIGRATION" ]; then
+            python3 - "$MIGRATION" << 'MIG_PY'
+          import re, sys
+          path = sys.argv[1]
+          with open(path, "r") as fh: data = fh.read()
+          if "FileProviderAvailability.isAvailable" in data: sys.exit(0)
+          pattern = re.compile(r'(^[ \t]*)private func deleteFileProviderStorage\(\) \{', re.M)
+          match = pattern.search(data)
+          if not match: sys.exit(0)
+          indent = match.group(1)
+          inner = indent + "  "
+          guard = f"\n{inner}guard FileProviderAvailability.isAvailable else {{\n{inner}  return\n{inner}}}\n"
+          data = data[:match.end()] + guard + data[match.end():]
+          with open(path, "w") as fh: fh.write(data)
+          print("  Migrator FileProvider guard applied")
+          MIG_PY
+          fi
+
+          echo "=== Step 9: Guard FileProvider in AppDelegate ==="
+          if [ -f "$APP_DELEGATE" ]; then
+            python3 - "$APP_DELEGATE" << 'APPDEL_PY'
+          import re, sys
+          path = sys.argv[1]
+          with open(path, "r") as fh: data = fh.read()
+          if "FileProviderAvailability isAvailable" in data: sys.exit(0)
+          lines = data.splitlines(keepends=True)
+          for idx, line in enumerate(lines):
+              if "_NSFileProviderManager syncWithBKHosts" in line:
+                  indent = re.match(r"[ \t]*", line).group(0)
+                  lines[idx:idx + 1] = [
+                      f"{indent}if ([FileProviderAvailability isAvailable]) {{\n",
+                      f"{indent}  [_NSFileProviderManager syncWithBKHosts];\n",
+                      f"{indent}}}\n",
+                  ]
+                  break
+          else:
+              sys.exit(0)
+          with open(path, "w") as fh: fh.write("".join(lines))
+          print("  AppDelegate FileProvider guard applied")
+          APPDEL_PY
+          fi
+
+          echo "=== Step 10: Create sideload entitlements ==="
           cat > Blink/Blink-sideload.entitlements << 'SIDELOAD_ENT'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>com.apple.security.application-groups</key>
-              <array>
-                  <string>group.sh.blink.blinkshell</string>
-              </array>
-              <key>keychain-access-groups</key>
-              <array>
-                  <string>$(AppIdentifierPrefix)sh.blink.blinkshell</string>
-              </array>
-              <key>get-task-allow</key>
+              <key>com.apple.developer.default-data-protection</key>
+              <string>NSFileProtectionComplete</string>
+              <key>com.apple.security.app-sandbox</key>
+              <true/>
+              <key>com.apple.security.device.bluetooth</key>
+              <true/>
+              <key>com.apple.security.device.camera</key>
+              <true/>
+              <key>com.apple.security.files.user-selected.read-write</key>
+              <true/>
+              <key>com.apple.security.network.client</key>
+              <true/>
+              <key>com.apple.security.network.server</key>
+              <true/>
+              <key>com.apple.security.personal-information.location</key>
               <true/>
           </dict>
           </plist>
           SIDELOAD_ENT
-
-          echo "=== Step 6: Point project to sideload entitlements ==="
           sed -i '' 's|Blink\.entitlements|Blink-sideload.entitlements|g' Blink.xcodeproj/project.pbxproj
 
-          echo "=== Step 7: Validate project file ==="
+          echo "=== Step 11: Validate project file ==="
           plutil -lint Blink.xcodeproj/project.pbxproj
-          echo "All patches applied successfully"
+          echo "All GPL patches applied successfully"
 
       - name: Resolve packages
         run: |
