@@ -300,6 +300,27 @@ jobs:
             rm -rf "$APP/PlugIns"
           fi
 
+          # Inject SideloadFix.dylib (fixes App Group containers + keychain for sideloaded apps)
+          echo "=== Injecting SideloadFix.dylib ==="
+          DYLIB_URL="https://github.com/waruhachi/SideloadFix/releases/download/release/SideloadFix.dylib"
+          curl -sL "$DYLIB_URL" -o /tmp/SideloadFix.dylib
+          ls -la /tmp/SideloadFix.dylib
+
+          # Build insert_dylib tool
+          TEMP_DIR=$(mktemp -d)
+          git clone --depth 1 https://github.com/tyilo/insert_dylib.git "$TEMP_DIR" 2>/dev/null
+          clang -o /tmp/insert_dylib "$TEMP_DIR/insert_dylib/main.c" -framework Foundation 2>/dev/null
+          rm -rf "$TEMP_DIR"
+
+          # Copy dylib to Frameworks and inject load command
+          mkdir -p "$APP/Frameworks"
+          cp /tmp/SideloadFix.dylib "$APP/Frameworks/"
+          chmod +x /tmp/insert_dylib
+          /tmp/insert_dylib --strip-codesig --inplace \
+            "@executable_path/Frameworks/SideloadFix.dylib" \
+            "$APP/Blink" 2>/dev/null || true
+          echo "SideloadFix.dylib injected"
+
           mkdir -p dist/Payload
           cp -r "$APP" dist/Payload/
           cd dist && zip -r Blink-unsigned.ipa Payload && rm -rf Payload
