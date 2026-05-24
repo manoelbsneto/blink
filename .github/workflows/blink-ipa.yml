@@ -48,15 +48,33 @@ jobs:
       - name: Build
         run: |
           cd builder/blink-src
+          DERIVED="$GITHUB_WORKSPACE/builder/build-output/DerivedData"
+          BUILD_PRODUCTS="$GITHUB_WORKSPACE/builder/build-output/Products"
           rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
-          xcodebuild -project Blink.xcodeproj -scheme Blink -configuration Release -destination "generic/platform=iOS" -sdk iphoneos -derivedDataPath ../build-output/DerivedData CONFIGURATION_BUILD_DIR=../build-output/Products -skipPackagePluginValidation -skipMacroValidation CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM= DEAD_CODE_STRIPPING=NO ENABLE_PREVIEWS=NO build 2>&1 | tee ../build.log
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -sdk iphoneos \
+            -derivedDataPath "$DERIVED" \
+            CONFIGURATION_BUILD_DIR="$BUILD_PRODUCTS" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM= \
+            DEAD_CODE_STRIPPING=NO \
+            ENABLE_PREVIEWS=NO \
+            build 2>&1 | tee ../build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           echo "Build exit: $BUILD_EXIT"
           if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo "=== LAST 80 LINES ==="
             tail -80 ../build.log
             exit 1
           fi
-          find ../build-output -name "*.app" -type d
+          find "$BUILD_PRODUCTS" -name "*.app" -type d
       - name: Package IPA
         if: success()
         run: |
