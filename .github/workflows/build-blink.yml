@@ -10,112 +10,50 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
 
     steps:
-      - name: "Setup Xcode"
+      - name: "Setup Xcode 16"
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s $(ls -d /Applications/Xcode*.app | tail -1)
+          # Xcode 16 on macos-15 has native visionOS support
           xcodebuild -version
           swift --version
+          # Download visionOS platform if not present
+          xcodebuild -downloadPlatform visionOS 2>&1 || echo "visionOS platform download skipped"
 
       - name: "Install jq"
         run: brew install jq || true
 
-      - name: "Clone + Setup source"
+      - name: "Clone + Setup"
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
           cd builder
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "${{ github.event.inputs.version }}" 2>&1 | tee setup.log
-          
-          # Fix pbxproj if needed
-          cd blink-src
-          plutil -lint Blink.xcodeproj/project.pbxproj || {
-            git checkout -- Blink.xcodeproj/project.pbxproj
-            sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
-          }
 
-      - name: "Resolve packages + Patch visionOS"
+      - name: "Fix project file"
         run: |
           cd builder/blink-src
           
-          # Step 1: Clear ALL SPM caches
-          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
-          rm -rf ~/Library/org.swift.swiftpm 2>/dev/null || true
+          echo "=== plutil check ==="
+          plutil -lint Blink.xcodeproj/project.pbxproj && echo "✅ Valid" && exit 0
           
-          # Step 2: Try to resolve (will fail on visionOS but downloads packages)
-          xcodebuild -project Blink.xcodeproj \
-            -scheme Blink \
-            -resolvePackageDependencies \
-            -skipPackagePluginValidation \
-            -skipMacroValidation 2>&1 || echo "Expected failure during resolve"
+          echo "⚠️ Invalid! Reverting to original + minimal patch"
+          git checkout -- Blink.xcodeproj/project.pbxproj
           
-          # Step 3: Patch visionOS from ALL Package.swift files EVERYWHERE
-          echo ""
-          echo "=== Patching visionOS from ALL locations ==="
+          # Only change DEVELOPMENT_TEAM (minimal patch)
+          sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
           
-          # Patch in SourcePackages checkouts
-          find ../build-output -name "Package.swift" 2>/dev/null | while read f; do
-            if grep -q "visionOS" "$f" 2>/dev/null; then
-              echo "Patching: $f"
-              sed -i '' '/\.visionOS/d' "$f"
-            fi
-          done
-          
-          # Patch in DerivedData SourcePackages
-          find ../build-output/DerivedData -name "Package.swift" 2>/dev/null | while read f; do
-            if grep -q "visionOS" "$f" 2>/dev/null; then
-              echo "Patching: $f"
-              sed -i '' '/\.visionOS/d' "$f"
-            fi
-          done
-          
-          # Patch in SPM global cache
-          find ~/Library/Caches/org.swift.swiftpm -name "Package.swift" 2>/dev/null | while read f; do
-            if grep -q "visionOS" "$f" 2>/dev/null; then
-              echo "Patching SPM cache: $f"
-              sed -i '' '/\.visionOS/d' "$f"
-            fi
-          done
-          
-          # Patch in SPM SourcePackages inside project
-          find . -path "*/SourcePackages/checkouts/*/Package.swift" 2>/dev/null | while read f; do
-            if grep -q "visionOS" "$f" 2>/dev/null; then
-              echo "Patching checkout: $f"
-              sed -i '' '/\.visionOS/d' "$f"
-            fi
-          done
-          
-          # NUCLEAR: find ALL Package.swift anywhere under home and build dirs
-          for dir in ~/Library/Caches ~/Library/Developer "$PWD" "../build-output"; do
-            find "$dir" -name "Package.swift" -maxdepth 10 2>/dev/null | while read f; do
-              if grep -q "\.visionOS" "$f" 2>/dev/null; then
-                echo "NUCLEAR patch: $f"
-                sed -i '' '/\.visionOS/d' "$f"
-              fi
-            done
-          done
-          
-          # Step 4: Clear manifest compilation cache (forces recompilation)
-          rm -rf ~/Library/Caches/org.swift.swiftpm/manifests 2>/dev/null || true
-          find ~/Library -path "*/ManifestLoading/*cached-async*" -delete 2>/dev/null || true
-          
-          # Step 5: Re-resolve packages (should work now)
-          echo ""
-          echo "=== Re-resolving packages after patch ==="
-          xcodebuild -project Blink.xcodeproj \
-            -scheme Blink \
-            -resolvePackageDependencies \
-            -skipPackagePluginValidation \
-            -skipMacroValidation 2>&1 | tail -20
-          
-          echo "✅ Package resolution complete"
+          plutil -lint Blink.xcodeproj/project.pbxproj
+          echo "✅ Fixed"
 
       - name: "Build"
         run: |
           cd builder/blink-src
+          
+          # Clear caches
+          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
           
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
@@ -134,6 +72,7 @@ jobs:
             build 2>&1 | tee ../build.log
           
           echo "=== Exit: ${PIPESTATUS[0]} ==="
+          find ../build-output -name "*.app" -type d
 
       - name: "Package IPA"
         if: success()
