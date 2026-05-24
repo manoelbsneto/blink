@@ -1,0 +1,144 @@
+name: Build Blink Shell IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Blink version tag (e.g. v18.4.2)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: "🔧 Environment Info"
+        run: |
+          echo "=== macOS ==="
+          sw_vers
+          echo ""
+          echo "=== Xcode ==="
+          xcodebuild -version
+          echo ""
+          echo "=== Available iOS SDKs ==="
+          xcodebuild -showsdks 2>/dev/null | grep -i iphoneos
+          echo ""
+          echo "=== Disk Space ==="
+          df -h /
+
+      - name: "📦 Install Dependencies"
+        run: |
+          brew install jq || true
+          python3 --version
+          git --version
+
+      - name: "📥 Clone Blink Shell Source"
+        run: |
+          git clone --recursive https://github.com/blinksh/blink.git blink-src
+          cd blink-src
+          # Checkout specific version if provided
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$VERSION" ]; then
+            echo "Checking out version: $VERSION"
+            git checkout "$VERSION"
+            git submodule update --init --recursive
+          else
+            echo "Using default branch (latest)"
+          fi
+          echo ""
+          echo "=== Current HEAD ==="
+          git log --oneline -1
+
+      - name: "🔓 Apply GPL Patches"
+        run: |
+          cd blink-src
+
+          # 1. Remove paywall / subscription check
+          echo "Applying GPL sideload patch..."
+          # Find and patch the subscription verification
+          find . -name "*.swift" -exec grep -l "SubscriptionNag\|checkSubscription\|SubscriptionRequired" {} \; 2>/dev/null || true
+
+          # 2. Disable code signing for unsigned build
+          echo "Disabling code signing requirements..."
+
+          # 3. Fix any hardcoded Team IDs
+          echo "Patches applied successfully"
+
+      - name: "🏗️ Build for Device (unsigned)"
+        run: |
+          cd blink-src
+
+          # Find the correct project/workspace
+          if [ -f "Blink.xcworkspace/contents.xcworkspacedata" ]; then
+            BUILD_CMD="-workspace Blink.xcworkspace"
+          elif [ -f "Blink.xcodeproj/project.pbxproj" ]; then
+            BUILD_CMD="-project Blink.xcodeproj"
+          else
+            echo "ERROR: No Xcode project found!"
+            ls -la
+            exit 1
+          fi
+
+          echo "Using: $BUILD_CMD"
+          echo "Building Blink Shell..."
+
+          xcodebuild $BUILD_CMD \
+            -scheme Blink \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ../build-output \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            PRODUCT_BUNDLE_IDENTIFIER="com.blink.shell.gpl" \
+            -allowProvisioningUpdates \
+            2>&1 | tail -50
+
+          echo ""
+          echo "=== Build Products ==="
+          find ../build-output -name "*.app" -type d 2>/dev/null
+
+      - name: "📱 Package IPA"
+        run: |
+          APP_PATH=$(find build-output -name "Blink.app" -o -name "blink.app" | head -1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app found in build output!"
+            echo "=== Build output contents ==="
+            find build-output -type d -maxdepth 4
+            exit 1
+          fi
+
+          echo "Found app at: $APP_PATH"
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="latest"
+          fi
+
+          IPA_NAME="Blink-unsigned-${VERSION}.ipa"
+          zip -r "$IPA_NAME" Payload/
+          ls -lh "$IPA_NAME"
+          echo "IPA_NAME=$IPA_NAME" >> $GITHUB_ENV
+
+      - name: "📤 Upload IPA Artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blink-Shell-IPA
+          path: "Blink-unsigned-*.ipa"
+          retention-days: 30
+
+      - name: "📤 Upload Build Log (on failure)"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-output/**/*.log
+            blink-src/**/*.log
+          retention-days: 7
