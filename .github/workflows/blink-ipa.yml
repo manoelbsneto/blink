@@ -1,6 +1,10 @@
 name: Build Blink Shell IPA
 
 on:
+  push:
+    branches: [raw]
+    paths:
+      - '.github/workflows/blink-ipa.yml'
   workflow_dispatch:
     inputs:
       version:
@@ -23,11 +27,13 @@ jobs:
         run: brew install jq || true
 
       - name: "Clone + Setup"
+        env:
+          VERSION: ${{ github.event.inputs.version || 'v18.4.2' }}
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
           cd builder
           chmod +x build-blink-shell-gpl.sh
-          ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "${{ github.event.inputs.version }}" 2>&1 | tee setup.log
+          ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$VERSION" 2>&1 | tee setup.log
 
       - name: "Fix pbxproj + Pin dependencies"
         run: |
