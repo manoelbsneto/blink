@@ -60,6 +60,14 @@ jobs:
             Blink.xcodeproj/project.pbxproj > /tmp/pbxproj.tmp && \
             mv /tmp/pbxproj.tmp Blink.xcodeproj/project.pbxproj
 
+          echo "=== Redirect cached-async-image to fixed fork ==="
+          grep -rl "lorenzofiamingo/swiftui-cached-async-image" . \
+            --include="*.pbxproj" --include="*.swift" --include="*.resolved" 2>/dev/null \
+            | while read f; do
+                echo "  Patching: $f"
+                sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
+              done
+
           echo "=== Verify project file ==="
           plutil -lint Blink.xcodeproj/project.pbxproj
           echo "Project fixes applied"
