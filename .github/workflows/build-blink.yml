@@ -80,7 +80,7 @@ for pin in pins:
 with open('$RESOLVED', 'w') as f:
     json.dump(data, f, indent=2)
 "
-              echo "✅ Package.resolved updated"
+              echo "âœ… Package.resolved updated"
               grep -A3 "cached-async" "$RESOLVED"
             fi
           else
@@ -126,7 +126,7 @@ with open('$RESOLVED', 'w') as f:
           echo "=== Build exit: $BUILD_EXIT ==="
           
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "❌ Build failed"
+            echo "âŒ Build failed"
             tail -50 ../build.log
             exit 1
           fi
@@ -138,8 +138,8 @@ with open('$RESOLVED', 'w') as f:
         run: |
           cd builder
           APP=$(find build-output -name "Blink.app" -type d | head -1)
-          [ -z "$APP" ] && { echo "❌ No .app"; exit 1; }
-          echo "✅ $APP"
+          [ -z "$APP" ] && { echo "âŒ No .app"; exit 1; }
+          echo "âœ… $APP"
           mkdir -p Payload dist
           cp -r "$APP" Payload/
           zip -r "dist/Blink-unsigned-${{ github.event.inputs.version }}.ipa" Payload/
