@@ -30,45 +30,35 @@ jobs:
           cd builder
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$BLINK_VERSION" 2>&1 | tee setup.log
-      - name: Fix project file
+      - name: Fix project and deps
         run: |
           cd builder/blink-src
+          echo "=== Fix pbxproj ==="
           plutil -lint Blink.xcodeproj/project.pbxproj || {
             echo "Reverting pbxproj"
             git checkout -- Blink.xcodeproj/project.pbxproj
             sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
             plutil -lint Blink.xcodeproj/project.pbxproj
           }
-      - name: Resolve and patch deps
-        run: |
-          cd builder/blink-src
-          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
-          echo "Step 1: Initial resolve (may fail)"
-          xcodebuild -project Blink.xcodeproj -scheme Blink -resolvePackageDependencies -skipPackagePluginValidation -skipMacroValidation 2>&1 || echo "Expected failure"
-          echo "Step 2: Patch swift-tools-version to 5.9 in deps with visionOS"
-          find ../build-output -name "Package.swift" -path "*checkouts*" 2>/dev/null | while read f; do
-            if grep -q "visionOS" "$f" 2>/dev/null; then
+          echo "=== Redirect cached-async-image to fixed fork ==="
+          find . -name "Package.swift" | while read f; do
+            if grep -q "lorenzofiamingo/swiftui-cached-async-image" "$f"; then
               echo "Patching $f"
-              sed -i '' '1s/swift-tools-version:[0-9.]*/swift-tools-version:5.9/' "$f"
-              head -1 "$f"
+              sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
+              grep "cached-async" "$f"
             fi
           done
-          find . -name "Package.swift" -path "*SourcePackages*checkouts*" 2>/dev/null | while read f; do
-            if grep -q "visionOS" "$f" 2>/dev/null; then
-              echo "Patching $f"
-              sed -i '' '1s/swift-tools-version:[0-9.]*/swift-tools-version:5.9/' "$f"
-              head -1 "$f"
+          find . -name "Package.resolved" | while read f; do
+            if grep -q "lorenzofiamingo/swiftui-cached-async-image" "$f"; then
+              echo "Patching resolved: $f"
+              sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
             fi
           done
-          echo "Step 3: Clear manifest cache"
-          rm -rf ~/Library/Caches/org.swift.swiftpm/manifests 2>/dev/null || true
-          find ~/Library/Caches -name "*cached-async-image*" -delete 2>/dev/null || true
-          echo "Step 4: Re-resolve"
-          xcodebuild -project Blink.xcodeproj -scheme Blink -resolvePackageDependencies -skipPackagePluginValidation -skipMacroValidation 2>&1 | tail -20
           echo "Done"
       - name: Build
         run: |
           cd builder/blink-src
+          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
           xcodebuild -project Blink.xcodeproj -scheme Blink -configuration Release -destination "generic/platform=iOS" -sdk iphoneos -derivedDataPath ../build-output/DerivedData CONFIGURATION_BUILD_DIR=../build-output/Products -skipPackagePluginValidation -skipMacroValidation CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM= DEAD_CODE_STRIPPING=NO ENABLE_PREVIEWS=NO build 2>&1 | tee ../build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           echo "Build exit: $BUILD_EXIT"
