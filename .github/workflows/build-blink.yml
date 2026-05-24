@@ -16,11 +16,8 @@ jobs:
     steps:
       - name: "Setup Xcode 16"
         run: |
-          # Xcode 16 on macos-15 has native visionOS support
           xcodebuild -version
           swift --version
-          # Download visionOS platform if not present
-          xcodebuild -downloadPlatform visionOS 2>&1 || echo "visionOS platform download skipped"
 
       - name: "Install jq"
         run: brew install jq || true
@@ -32,33 +29,87 @@ jobs:
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "${{ github.event.inputs.version }}" 2>&1 | tee setup.log
 
-      - name: "Fix project file"
+      - name: "Fix pbxproj + Pin dependencies"
         run: |
           cd builder/blink-src
           
-          echo "=== plutil check ==="
-          plutil -lint Blink.xcodeproj/project.pbxproj && echo "✅ Valid" && exit 0
+          # 1. Fix pbxproj
+          echo "=== Fixing pbxproj ==="
+          plutil -lint Blink.xcodeproj/project.pbxproj || {
+            echo "Reverting + minimal patch"
+            git checkout -- Blink.xcodeproj/project.pbxproj
+            sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
+            plutil -lint Blink.xcodeproj/project.pbxproj
+          }
           
-          echo "⚠️ Invalid! Reverting to original + minimal patch"
-          git checkout -- Blink.xcodeproj/project.pbxproj
+          # 2. Pin swiftui-cached-async-image to 2.1.1 (no visionOS)
+          echo ""
+          echo "=== Downgrading swiftui-cached-async-image to 2.1.1 ==="
           
-          # Only change DEVELOPMENT_TEAM (minimal patch)
-          sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
+          # Find and update Package.resolved
+          RESOLVED=$(find . -name "Package.resolved" -path "*/Blink*" | head -1)
+          if [ -z "$RESOLVED" ]; then
+            RESOLVED=$(find . -name "Package.resolved" | head -1)
+          fi
           
-          plutil -lint Blink.xcodeproj/project.pbxproj
-          echo "✅ Fixed"
+          if [ -n "$RESOLVED" ]; then
+            echo "Found: $RESOLVED"
+            # Replace the version and revision for swiftui-cached-async-image
+            # Pin to 2.1.1 commit
+            if grep -q "swiftui-cached-async-image" "$RESOLVED"; then
+              echo "Patching swiftui-cached-async-image to 2.1.1..."
+              python3 -c "
+import json, sys
+
+with open('$RESOLVED', 'r') as f:
+    data = json.load(f)
+
+pins = data.get('pins', data.get('object', {}).get('pins', []))
+for pin in pins:
+    identity = pin.get('identity', pin.get('package', ''))
+    if 'cached-async-image' in identity.lower():
+        state = pin.get('state', {})
+        state['version'] = '2.1.1'
+        # Clear revision to force re-resolve to 2.1.1
+        if 'revision' in state:
+            state['revision'] = None
+        pin['state'] = state
+        print(f'Pinned {identity} to 2.1.1')
+        break
+
+with open('$RESOLVED', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+              echo "✅ Package.resolved updated"
+              grep -A3 "cached-async" "$RESOLVED"
+            fi
+          else
+            echo "No Package.resolved found"
+          fi
+          
+          # 3. Also try to modify the Package.swift dependency if it exists
+          if [ -f "Package.swift" ]; then
+            echo ""
+            echo "=== Checking Package.swift ==="
+            grep "cached-async" Package.swift || echo "Not in Package.swift"
+          fi
 
       - name: "Build"
         run: |
           cd builder/blink-src
           
-          # Clear caches
+          # Clear SPM cache
           rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
+          
+          echo "============================================"
+          echo "  Building Blink Shell (Xcode 16)"
+          echo "============================================"
           
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
             -configuration Release \
             -destination "generic/platform=iOS" \
+            -sdk iphoneos \
             -derivedDataPath ../build-output/DerivedData \
             CONFIGURATION_BUILD_DIR=../build-output/Products \
             -skipPackagePluginValidation \
@@ -71,7 +122,15 @@ jobs:
             ENABLE_PREVIEWS=NO \
             build 2>&1 | tee ../build.log
           
-          echo "=== Exit: ${PIPESTATUS[0]} ==="
+          BUILD_EXIT=${PIPESTATUS[0]}
+          echo "=== Build exit: $BUILD_EXIT ==="
+          
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo "❌ Build failed"
+            tail -50 ../build.log
+            exit 1
+          fi
+          
           find ../build-output -name "*.app" -type d
 
       - name: "Package IPA"
