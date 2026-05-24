@@ -63,7 +63,30 @@ jobs:
                 sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
               done
 
-          echo "=== Step 5: Validate project file ==="
+          echo "=== Step 5: Create sideload-friendly entitlements ==="
+          cat > Blink/Blink-sideload.entitlements << 'SIDELOAD_ENT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.application-groups</key>
+              <array>
+                  <string>group.sh.blink.blinkshell</string>
+              </array>
+              <key>keychain-access-groups</key>
+              <array>
+                  <string>$(AppIdentifierPrefix)sh.blink.blinkshell</string>
+              </array>
+              <key>get-task-allow</key>
+              <true/>
+          </dict>
+          </plist>
+          SIDELOAD_ENT
+
+          echo "=== Step 6: Point project to sideload entitlements ==="
+          sed -i '' 's|Blink\.entitlements|Blink-sideload.entitlements|g' Blink.xcodeproj/project.pbxproj
+
+          echo "=== Step 7: Validate project file ==="
           plutil -lint Blink.xcodeproj/project.pbxproj
           echo "All patches applied successfully"
 
@@ -119,6 +142,13 @@ jobs:
           APP=$(find build-output -name "Blink.app" -type d | head -1)
           if [ -z "$APP" ]; then echo "ERROR: No .app bundle found"; exit 1; fi
           echo "Packaging: $APP"
+
+          # Strip FileProvider extensions (crash without paid dev entitlements)
+          if [ -d "$APP/PlugIns" ]; then
+            echo "Stripping PlugIns: $(ls $APP/PlugIns/)"
+            rm -rf "$APP/PlugIns"
+          fi
+
           mkdir -p dist/Payload
           cp -r "$APP" dist/Payload/
           cd dist && zip -r Blink-unsigned.ipa Payload && rm -rf Payload
