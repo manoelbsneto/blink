@@ -16,98 +16,160 @@ jobs:
     steps:
       - name: "🔧 Environment Info"
         run: |
-          echo "=== macOS ==="
           sw_vers
-          echo "=== Xcode ==="
           xcodebuild -version
-          echo "=== Disk ==="
           df -h /
 
       - name: "📦 Install Dependencies"
-        run: |
-          brew install jq || true
+        run: brew install jq || true
 
-      - name: "📥 Clone GPL Builder"
+      - name: "📥 Clone GPL Builder + Blink Source"
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
-          ls -la builder/
+          cd builder
+          chmod +x build-blink-shell-gpl.sh
+          
+          # Only setup/clone, don't build yet
+          VERSION="${{ github.event.inputs.version }}"
+          ./build-blink-shell-gpl.sh --setup-only --keep-source --version "$VERSION" 2>&1 | tee setup.log
+          
+          echo ""
+          echo "=== Verify project file exists ==="
+          ls -la blink-src/Blink.xcodeproj/project.pbxproj
+
+      - name: "🔍 Validate project.pbxproj BEFORE build"
+        run: |
+          cd builder/blink-src
+          echo "=== Validating project file ==="
+          plutil -lint Blink.xcodeproj/project.pbxproj || {
+            echo ""
+            echo "⚠️ Project file is INVALID after patching!"
+            echo "=== Attempting auto-fix ==="
+            
+            # Show the area around the error
+            echo "=== Lines around 4278 ==="
+            sed -n '4270,4290p' Blink.xcodeproj/project.pbxproj
+            
+            echo ""
+            echo "=== Checking for common issues ==="
+            # Check for missing semicolons in TEAM_ID replacements
+            grep -n 'DEVELOPMENT_TEAM' Blink.xcodeproj/project.pbxproj | head -20
+            
+            # Fix: ensure all DEVELOPMENT_TEAM lines end with semicolon
+            sed -i '' 's/DEVELOPMENT_TEAM = "[^"]*"$/DEVELOPMENT_TEAM = "";/' Blink.xcodeproj/project.pbxproj
+            sed -i '' 's/DEVELOPMENT_TEAM = [^;]*$/&;/' Blink.xcodeproj/project.pbxproj
+            
+            # Fix: remove any double semicolons
+            sed -i '' 's/;;/;/g' Blink.xcodeproj/project.pbxproj
+            
+            echo ""
+            echo "=== Re-validating ==="
+            plutil -lint Blink.xcodeproj/project.pbxproj || {
+              echo "❌ Still invalid. Showing full diff of changes..."
+              echo "=== Last 5 git changes ==="
+              git diff --stat HEAD
+              echo ""
+              echo "=== Checking all lines without semicolons ==="
+              grep -n '= [^{/][^;]*$' Blink.xcodeproj/project.pbxproj | grep -v '/\*' | grep -v '^$' | head -20
+              
+              # Nuclear option: try reverting pbxproj and only applying minimal patches
+              echo ""
+              echo "=== NUCLEAR: Reverting to original pbxproj ==="
+              git checkout -- Blink.xcodeproj/project.pbxproj
+              
+              # Apply only essential patches manually
+              sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
+              
+              echo "=== Final validation ==="
+              plutil -lint Blink.xcodeproj/project.pbxproj
+            }
+          }
+          echo "✅ Project file is valid!"
 
       - name: "🔨 Build Blink Shell"
         run: |
-          cd builder
-          chmod +x build-blink-shell-gpl.sh
-
-          VERSION="${{ github.event.inputs.version }}"
+          cd builder/blink-src
+          
           echo "============================================"
-          echo "  Building Blink Shell $VERSION"
+          echo "  Building Blink Shell (xcodebuild)"
           echo "============================================"
-
-          # Clean any caches first
+          
+          # Clear caches
           rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
-          rm -rf ~/Library/Developer/Xcode/DerivedData/* 2>/dev/null || true
-
-          # Run with overwrite and clean to ensure fresh build
-          ./build-blink-shell-gpl.sh \
-            --overwrite \
-            --clean \
-            --keep-build \
-            --keep-source \
-            --version "$VERSION" 2>&1 | tee build-full.log
-
+          
+          # Resolve packages first
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -resolvePackageDependencies \
+            -skipPackagePluginValidation \
+            -skipMacroValidation 2>&1 | tail -20
+          
           echo ""
-          echo "=== Exit code: $? ==="
-          echo "=== Checking for IPA ==="
-          find . -name "*.ipa" -type f -exec ls -lh {} \; || echo "No IPA found"
-          ls -lh dist/ 2>/dev/null || echo "No dist/ directory"
+          echo "=== Starting build ==="
+          
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath ../build-output/DerivedData \
+            CONFIGURATION_BUILD_DIR=../build-output/Products \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            DEAD_CODE_STRIPPING=NO \
+            ENABLE_PREVIEWS=NO \
+            clean build 2>&1 | tee ../build.log | tail -50
+          
+          echo ""
+          echo "=== Build exit code: ${PIPESTATUS[0]} ==="
+          echo "=== Searching for .app ==="
+          find ../build-output -name "*.app" -type d 2>/dev/null
 
-      - name: "📦 Prepare IPA for upload"
+      - name: "📱 Package IPA"
         if: always()
         run: |
           cd builder
-
-          # Find any IPA file
-          IPA=$(find . -name "*.ipa" -type f | head -1)
           
-          if [ -n "$IPA" ]; then
-            echo "✅ Found IPA: $IPA"
-            cp "$IPA" ../Blink-Shell.ipa
-            ls -lh ../Blink-Shell.ipa
-          else
-            echo "❌ No IPA found"
-            echo "=== Checking blink-src for .app ==="
-            find blink-src -name "*.app" -type d 2>/dev/null | head -5 || echo "No .app found"
-            find build-output -name "*.app" -type d 2>/dev/null | head -5 || echo "No .app in build-output"
-            
-            # Try to package manually if .app exists
-            APP=$(find . -name "Blink.app" -type d | head -1)
-            if [ -n "$APP" ]; then
-              echo "Found .app at $APP — packaging manually"
-              mkdir -p Payload
-              cp -r "$APP" Payload/
-              zip -r ../Blink-Shell.ipa Payload/
-              ls -lh ../Blink-Shell.ipa
-            else
-              echo "=== Build log tail ==="
-              tail -100 build-full.log 2>/dev/null || true
-              tail -100 build-output/build.log 2>/dev/null || true
-              exit 1
-            fi
+          # Find .app
+          APP=$(find build-output -name "Blink.app" -type d 2>/dev/null | head -1)
+          
+          if [ -z "$APP" ]; then
+            APP=$(find . -name "*.app" -type d -not -path "*/Intermediates*" 2>/dev/null | head -1)
           fi
+          
+          if [ -z "$APP" ]; then
+            echo "❌ No .app found"
+            echo "=== build.log tail ==="
+            tail -80 build.log 2>/dev/null
+            exit 1
+          fi
+          
+          echo "✅ Found: $APP"
+          mkdir -p Payload
+          cp -r "$APP" Payload/
+          
+          VERSION="${{ github.event.inputs.version }}"
+          zip -r "../Blink-unsigned-${VERSION}.ipa" Payload/
+          ls -lh "../Blink-unsigned-${VERSION}.ipa"
 
       - name: "📤 Upload IPA"
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Blink-Shell-IPA
-          path: "Blink-Shell.ipa"
+          name: Blink-Shell-IPA-${{ github.event.inputs.version }}
+          path: "Blink-unsigned-*.ipa"
           retention-days: 30
 
-      - name: "📤 Upload All Logs"
+      - name: "📤 Upload Logs"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
-            builder/build-full.log
-            builder/build-output/build.log
+            builder/build.log
+            builder/setup.log
+            builder/build-output/**/*.log
           retention-days: 7
