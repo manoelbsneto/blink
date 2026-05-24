@@ -30,31 +30,21 @@ jobs:
           cd builder
           chmod +x build-blink-shell-gpl.sh
           ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$BLINK_VERSION" 2>&1 | tee setup.log
-      - name: Fix project and deps
+      - name: Fix project and redirect deps
         run: |
           cd builder/blink-src
           echo "=== Fix pbxproj ==="
-          plutil -lint Blink.xcodeproj/project.pbxproj || {
-            echo "Reverting pbxproj"
-            git checkout -- Blink.xcodeproj/project.pbxproj
-            sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
-            plutil -lint Blink.xcodeproj/project.pbxproj
-          }
-          echo "=== Redirect cached-async-image to fixed fork ==="
-          find . -name "Package.swift" | while read f; do
-            if grep -q "lorenzofiamingo/swiftui-cached-async-image" "$f"; then
-              echo "Patching $f"
-              sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
-              grep "cached-async" "$f"
-            fi
+          git checkout -- Blink.xcodeproj/project.pbxproj
+          sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
+          plutil -lint Blink.xcodeproj/project.pbxproj
+          echo "=== Redirect ALL refs to cached-async-image fork ==="
+          grep -rl "lorenzofiamingo/swiftui-cached-async-image" . --include="*.pbxproj" --include="*.swift" --include="*.resolved" 2>/dev/null | while read f; do
+            echo "Patching: $f"
+            sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
           done
-          find . -name "Package.resolved" | while read f; do
-            if grep -q "lorenzofiamingo/swiftui-cached-async-image" "$f"; then
-              echo "Patching resolved: $f"
-              sed -i '' 's|lorenzofiamingo/swiftui-cached-async-image|manoelbsneto/swiftui-cached-async-image|g' "$f"
-            fi
-          done
-          echo "Done patching"
+          echo "=== Verify redirect ==="
+          grep -r "cached-async-image" . --include="*.pbxproj" --include="*.resolved" | head -5
+          echo "Done"
       - name: Build
         run: |
           cd builder/blink-src
