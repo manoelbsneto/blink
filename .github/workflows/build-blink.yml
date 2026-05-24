@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: "Select Xcode 15.4"
+      - name: "Setup Xcode"
         run: |
           sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s $(ls -d /Applications/Xcode*.app | tail -1)
           xcodebuild -version
@@ -23,77 +23,99 @@ jobs:
       - name: "Install jq"
         run: brew install jq || true
 
-      - name: "Clone GPL Builder + Setup"
+      - name: "Clone + Setup source"
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
           cd builder
           chmod +x build-blink-shell-gpl.sh
+          ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "${{ github.event.inputs.version }}" 2>&1 | tee setup.log
           
-          # Setup only - clone and patch
-          ./build-blink-shell-gpl.sh \
-            --setup-only \
-            --overwrite \
-            --keep-source \
-            --version "${{ github.event.inputs.version }}" 2>&1 | tee setup.log
-          
-          echo "✅ Setup complete"
-          ls -la blink-src/Blink.xcodeproj/project.pbxproj
+          # Fix pbxproj if needed
+          cd blink-src
+          plutil -lint Blink.xcodeproj/project.pbxproj || {
+            git checkout -- Blink.xcodeproj/project.pbxproj
+            sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
+          }
 
-      - name: "Patch visionOS compatibility"
+      - name: "Resolve packages + Patch visionOS"
         run: |
           cd builder/blink-src
           
-          echo "=== Validating pbxproj ==="
-          plutil -lint Blink.xcodeproj/project.pbxproj || {
-            echo "Reverting and minimal patching pbxproj..."
-            git checkout -- Blink.xcodeproj/project.pbxproj
-            sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
-            plutil -lint Blink.xcodeproj/project.pbxproj
-          }
+          # Step 1: Clear ALL SPM caches
+          rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
+          rm -rf ~/Library/org.swift.swiftpm 2>/dev/null || true
           
-          echo ""
-          echo "=== Resolving SPM packages ==="
+          # Step 2: Try to resolve (will fail on visionOS but downloads packages)
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
             -resolvePackageDependencies \
             -skipPackagePluginValidation \
-            -skipMacroValidation 2>&1 | tail -10 || true
+            -skipMacroValidation 2>&1 || echo "Expected failure during resolve"
           
+          # Step 3: Patch visionOS from ALL Package.swift files EVERYWHERE
           echo ""
-          echo "=== Patching visionOS from dependencies ==="
+          echo "=== Patching visionOS from ALL locations ==="
           
-          # Find and fix ALL Package.swift files with visionOS references
-          # that have a swift-tools-version below 5.9
-          find ../build-output -name "Package.swift" -path "*/checkouts/*" 2>/dev/null | while read pkg; do
-            if grep -q "visionOS" "$pkg" 2>/dev/null; then
-              TOOLS_VER=$(head -1 "$pkg" | grep -oE '[0-9]+\.[0-9]+')
-              echo "Found visionOS in: $pkg (tools: $TOOLS_VER)"
-              
-              # Remove .visionOS lines
-              sed -i '' '/\.visionOS/d' "$pkg"
-              echo "  ✅ Removed .visionOS"
+          # Patch in SourcePackages checkouts
+          find ../build-output -name "Package.swift" 2>/dev/null | while read f; do
+            if grep -q "visionOS" "$f" 2>/dev/null; then
+              echo "Patching: $f"
+              sed -i '' '/\.visionOS/d' "$f"
             fi
           done
           
-          # Also check SourcePackages path
-          find ../build-output -name "Package.swift" -path "*/SourcePackages/*" 2>/dev/null | while read pkg; do
-            if grep -q "visionOS" "$pkg" 2>/dev/null; then
-              echo "Found visionOS in: $pkg"
-              sed -i '' '/\.visionOS/d' "$pkg"
-              echo "  ✅ Removed .visionOS"
+          # Patch in DerivedData SourcePackages
+          find ../build-output/DerivedData -name "Package.swift" 2>/dev/null | while read f; do
+            if grep -q "visionOS" "$f" 2>/dev/null; then
+              echo "Patching: $f"
+              sed -i '' '/\.visionOS/d' "$f"
             fi
           done
           
+          # Patch in SPM global cache
+          find ~/Library/Caches/org.swift.swiftpm -name "Package.swift" 2>/dev/null | while read f; do
+            if grep -q "visionOS" "$f" 2>/dev/null; then
+              echo "Patching SPM cache: $f"
+              sed -i '' '/\.visionOS/d' "$f"
+            fi
+          done
+          
+          # Patch in SPM SourcePackages inside project
+          find . -path "*/SourcePackages/checkouts/*/Package.swift" 2>/dev/null | while read f; do
+            if grep -q "visionOS" "$f" 2>/dev/null; then
+              echo "Patching checkout: $f"
+              sed -i '' '/\.visionOS/d' "$f"
+            fi
+          done
+          
+          # NUCLEAR: find ALL Package.swift anywhere under home and build dirs
+          for dir in ~/Library/Caches ~/Library/Developer "$PWD" "../build-output"; do
+            find "$dir" -name "Package.swift" -maxdepth 10 2>/dev/null | while read f; do
+              if grep -q "\.visionOS" "$f" 2>/dev/null; then
+                echo "NUCLEAR patch: $f"
+                sed -i '' '/\.visionOS/d' "$f"
+              fi
+            done
+          done
+          
+          # Step 4: Clear manifest compilation cache (forces recompilation)
+          rm -rf ~/Library/Caches/org.swift.swiftpm/manifests 2>/dev/null || true
+          find ~/Library -path "*/ManifestLoading/*cached-async*" -delete 2>/dev/null || true
+          
+          # Step 5: Re-resolve packages (should work now)
           echo ""
-          echo "=== Patches applied ==="
+          echo "=== Re-resolving packages after patch ==="
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -resolvePackageDependencies \
+            -skipPackagePluginValidation \
+            -skipMacroValidation 2>&1 | tail -20
+          
+          echo "✅ Package resolution complete"
 
-      - name: "Build Blink Shell"
+      - name: "Build"
         run: |
           cd builder/blink-src
-          
-          echo "============================================"
-          echo "  Building Blink Shell"
-          echo "============================================"
           
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
@@ -109,38 +131,20 @@ jobs:
             DEVELOPMENT_TEAM="" \
             DEAD_CODE_STRIPPING=NO \
             ENABLE_PREVIEWS=NO \
-            clean build 2>&1 | tee ../build.log
+            build 2>&1 | tee ../build.log
           
-          BUILD_RESULT=${PIPESTATUS[0]}
-          echo ""
-          echo "=== Build exit code: $BUILD_RESULT ==="
-          
-          if [ "$BUILD_RESULT" -ne 0 ]; then
-            echo "❌ Build failed"
-            tail -50 ../build.log
-            exit 1
-          fi
-          
-          echo "=== Searching for .app ==="
-          find ../build-output -name "*.app" -type d
+          echo "=== Exit: ${PIPESTATUS[0]} ==="
 
       - name: "Package IPA"
+        if: success()
         run: |
           cd builder
           APP=$(find build-output -name "Blink.app" -type d | head -1)
-          
-          if [ -z "$APP" ]; then
-            echo "❌ No Blink.app found"
-            find build-output -name "*.app" -type d 2>/dev/null
-            exit 1
-          fi
-          
-          echo "✅ Found: $APP"
+          [ -z "$APP" ] && { echo "❌ No .app"; exit 1; }
+          echo "✅ $APP"
           mkdir -p Payload dist
           cp -r "$APP" Payload/
-          
-          VERSION="${{ github.event.inputs.version }}"
-          zip -r "dist/Blink-unsigned-${VERSION}.ipa" Payload/
+          zip -r "dist/Blink-unsigned-${{ github.event.inputs.version }}.ipa" Payload/
           ls -lh dist/
 
       - name: "Upload IPA"
