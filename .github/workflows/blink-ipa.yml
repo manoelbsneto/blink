@@ -3,86 +3,57 @@ name: Build Blink Shell IPA
 on:
   push:
     branches: [raw]
-    paths:
-      - '.github/workflows/blink-ipa.yml'
+    paths: ['.github/workflows/blink-ipa.yml']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Blink version tag'
+        description: Blink version tag
         required: false
-        default: 'v18.4.2'
+        default: v18.4.2
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      BLINK_VERSION: ${{ github.event.inputs.version || 'v18.4.2' }}
 
     steps:
-      - name: "Setup Xcode 16"
+      - name: Setup Xcode 16
         run: |
           xcodebuild -version
           swift --version
 
-      - name: "Install jq"
+      - name: Install jq
         run: brew install jq || true
 
-      - name: "Clone + Setup"
-        env:
-          VERSION: ${{ github.event.inputs.version || 'v18.4.2' }}
+      - name: Clone and Setup
         run: |
           git clone https://github.com/NewsGuyTor/Blink-Shell-GPL-Builder.git builder
           cd builder
           chmod +x build-blink-shell-gpl.sh
-          ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$VERSION" 2>&1 | tee setup.log
+          ./build-blink-shell-gpl.sh --setup-only --overwrite --keep-source --version "$BLINK_VERSION" 2>&1 | tee setup.log
 
-      - name: "Fix pbxproj + Pin dependencies"
+      - name: Fix pbxproj and Pin deps
         run: |
           cd builder/blink-src
-
-          echo "=== Fixing pbxproj ==="
           plutil -lint Blink.xcodeproj/project.pbxproj || {
-            echo "Reverting + minimal patch"
+            echo "Reverting and patching pbxproj"
             git checkout -- Blink.xcodeproj/project.pbxproj
             sed -i '' 's/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = ""/g' Blink.xcodeproj/project.pbxproj
             plutil -lint Blink.xcodeproj/project.pbxproj
           }
-
-          echo ""
-          echo "=== Downgrading swiftui-cached-async-image to 2.1.1 ==="
-
+          echo "Pinning swiftui-cached-async-image to 2.1.1"
           RESOLVED=$(find . -name "Package.resolved" | head -1)
-          if [ -n "$RESOLVED" ]; then
-            echo "Found: $RESOLVED"
-            if grep -q "swiftui-cached-async-image" "$RESOLVED"; then
-              python3 -c "
-import json
-with open('$RESOLVED', 'r') as f:
-    data = json.load(f)
-pins = data.get('pins', data.get('object', {}).get('pins', []))
-for pin in pins:
-    identity = pin.get('identity', pin.get('package', ''))
-    if 'cached-async-image' in identity.lower():
-        state = pin.get('state', {})
-        state['version'] = '2.1.1'
-        if 'revision' in state:
-            state['revision'] = None
-        pin['state'] = state
-        print(f'Pinned {identity} to 2.1.1')
-        break
-with open('$RESOLVED', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-              echo "Done"
-              grep -A3 "cached-async" "$RESOLVED"
-            fi
+          if [ -n "$RESOLVED" ] && grep -q "cached-async-image" "$RESOLVED"; then
+            sed -i '' 's/"version" *: *"2\.1\.2"/"version" : "2.1.1"/g' "$RESOLVED"
+            grep "cached-async" "$RESOLVED" -A5
           fi
 
-      - name: "Build"
+      - name: Build
         run: |
           cd builder/blink-src
-
           rm -rf ~/Library/Caches/org.swift.swiftpm 2>/dev/null || true
-
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
             -configuration Release \
@@ -92,38 +63,34 @@ with open('$RESOLVED', 'w') as f:
             CONFIGURATION_BUILD_DIR=../build-output/Products \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            DEVELOPMENT_TEAM="" \
+            DEVELOPMENT_TEAM= \
             DEAD_CODE_STRIPPING=NO \
             ENABLE_PREVIEWS=NO \
             build 2>&1 | tee ../build.log
-
           BUILD_EXIT=${PIPESTATUS[0]}
-          echo "=== Build exit: $BUILD_EXIT ==="
-
+          echo "Build exit code: $BUILD_EXIT"
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "Build failed"
             tail -50 ../build.log
             exit 1
           fi
-
           find ../build-output -name "*.app" -type d
 
-      - name: "Package IPA"
+      - name: Package IPA
         if: success()
         run: |
           cd builder
           APP=$(find build-output -name "Blink.app" -type d | head -1)
-          [ -z "$APP" ] && { echo "No .app"; exit 1; }
-          echo "Found: $APP"
+          if [ -z "$APP" ]; then echo "No app found"; exit 1; fi
+          echo "Found $APP"
           mkdir -p Payload dist
           cp -r "$APP" Payload/
-          zip -r "dist/Blink-unsigned-${{ github.event.inputs.version }}.ipa" Payload/
+          zip -r "dist/Blink-unsigned-${BLINK_VERSION}.ipa" Payload/
           ls -lh dist/
 
-      - name: "Upload IPA"
+      - name: Upload IPA
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -131,7 +98,7 @@ with open('$RESOLVED', 'w') as f:
           path: builder/dist/*.ipa
           retention-days: 30
 
-      - name: "Upload Logs"
+      - name: Upload Logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
